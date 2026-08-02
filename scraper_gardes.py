@@ -14,8 +14,9 @@ import re
 import sys
 from datetime import datetime
 
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
+import requests
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -41,7 +42,15 @@ def normaliser(nom):
 
 
 def recuperer_page_inam():
-    resp = requests.get(INAM_URL, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    scraper = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        "Referer": "https://www.google.com/",
+    }
+    resp = scraper.get(INAM_URL, timeout=30, headers=headers)
     resp.raise_for_status()
     return BeautifulSoup(resp.text, "html.parser")
 
