@@ -36,9 +36,16 @@ MOIS_FR = {
 }
 
 
+import unicodedata
+
+
 def normaliser(nom):
-    """Meme logique que la colonne generee nom_normalise en base."""
-    return re.sub(r"[^a-zA-Z0-9]", "", nom or "").upper()
+    """Meme logique que la colonne generee nom_normalise en base :
+    on enleve les accents, puis tout ce qui n'est pas alphanumerique."""
+    if not nom:
+        return ""
+    sans_accents = unicodedata.normalize("NFKD", nom).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-zA-Z0-9]", "", sans_accents).upper()
 
 
 def recuperer_page_inam():
@@ -166,6 +173,20 @@ def logguer_non_reconnue(entree, semaine_debut):
     r.raise_for_status()
 
 
+import difflib
+
+
+def trouver_meilleure_correspondance(cle, index_normalise, seuil=0.62):
+    """Cherche la pharmacie de la base dont le nom normalise ressemble
+    le plus a `cle`. Retourne None si rien d'assez proche (seuil)."""
+    if cle in index_normalise:
+        return index_normalise[cle]
+    candidats = difflib.get_close_matches(cle, index_normalise.keys(), n=1, cutoff=seuil)
+    if candidats:
+        return index_normalise[candidats[0]]
+    return None
+
+
 def main():
     print("Recuperation de la page INAM...")
     soup = recuperer_page_inam()
@@ -185,14 +206,7 @@ def main():
     trouvees, non_trouvees = 0, 0
     for entree in entrees:
         cle = normaliser(entree["nom_brut"])
-        pharmacie = index_normalise.get(cle)
-
-        if pharmacie is None:
-            # tentative simple : essaye sans le mot PHARMACIE en double, ou en sous-chaine
-            for cle_db, p in index_normalise.items():
-                if cle in cle_db or cle_db in cle:
-                    pharmacie = p
-                    break
+        pharmacie = trouver_meilleure_correspondance(cle, index_normalise)
 
         if pharmacie:
             marquer_de_garde(pharmacie["id"])
