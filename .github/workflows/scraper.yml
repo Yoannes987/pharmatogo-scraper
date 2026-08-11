@@ -2,8 +2,11 @@ name: Maj hebdo pharmacies de garde
 
 on:
   schedule:
-    # Chaque lundi a 06h00 UTC (= heure du Togo, meme fuseau)
-    - cron: "0 6 * * 1"
+    # Scan chaque heure, du dimanche au mardi, pour ne jamais rater
+    # la publication de la nouvelle semaine par l'INAM (l'heure exacte
+    # n'est pas garantie de leur cote). Sans risque de repetition : le
+    # script ne fait que confirmer si rien n'a change.
+    - cron: "0 * * * 0,1,2"
   workflow_dispatch: {}   # permet de lancer le scraper manuellement depuis GitHub, pour tester
 
 jobs:
