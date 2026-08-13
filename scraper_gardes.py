@@ -292,13 +292,14 @@ def main():
     entrees = extraire_pharmacies_de_garde(soup)
     print(f"{len(entrees)} pharmacies de garde trouvees sur inam.tg")
 
-    # Garde-fou : si le site a change de format et qu'on ne trouve
-    # presque rien, on s'arrete AVANT d'effacer les vraies donnees
-    # actuelles -- mieux vaut garder une info perimee visible qu'une
-    # info fausse (personne de garde nulle part).
-    if len(entrees) < 10:
-        print(f"ERREUR : seulement {len(entrees)} pharmacie(s) trouvee(s), ce qui est anormalement bas.")
-        print("-> Le format de la page INAM a peut-etre change. Arret par securite, aucune donnee modifiee.")
+    # Garde-fou : seulement si la page ne renvoie STRICTEMENT rien
+    # (0 pharmacie). Un petit nombre (meme 5, 10...) peut etre une
+    # vraie semaine calme -- on ne bloque jamais sur ca, seulement
+    # sur une liste totalement vide, signe quasi certain d'un
+    # changement de format cote INAM.
+    if len(entrees) == 0:
+        print("ERREUR : aucune pharmacie trouvee sur la page INAM.")
+        print("-> Le format de la page a peut-etre change. Arret par securite, aucune donnee modifiee.")
         sys.exit(1)
 
     pharmacies_db = recuperer_pharmacies_existantes()
