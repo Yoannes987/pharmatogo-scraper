@@ -249,6 +249,9 @@ def enregistrer_historique(pharmacie_id, semaine_debut, semaine_fin):
     r = requests.post(
         f"{SUPABASE_URL}/rest/v1/gardes_historique",
         headers={**HEADERS, "Prefer": "resolution=merge-duplicates"},
+        params={"on_conflict": "pharmacie_id,semaine_debut"},  # sans ca, merge-duplicates
+                                                                 # ne sait pas quelle contrainte
+                                                                 # utiliser et Postgres refuse (409)
         json={
             "pharmacie_id": pharmacie_id,
             "semaine_debut": semaine_debut.isoformat(),
@@ -289,30 +292,47 @@ def main():
     entrees = extraire_pharmacies_de_garde(soup)
     print(f"{len(entrees)} pharmacies de garde trouvees sur inam.tg")
 
+    # Garde-fou : si le site a change de format et qu'on ne trouve
+    # presque rien, on s'arrete AVANT d'effacer les vraies donnees
+    # actuelles -- mieux vaut garder une info perimee visible qu'une
+    # info fausse (personne de garde nulle part).
+    if len(entrees) < 10:
+        print(f"ERREUR : seulement {len(entrees)} pharmacie(s) trouvee(s), ce qui est anormalement bas.")
+        print("-> Le format de la page INAM a peut-etre change. Arret par securite, aucune donnee modifiee.")
+        sys.exit(1)
+
     pharmacies_db = recuperer_pharmacies_existantes()
     print(f"{len(pharmacies_db)} pharmacies dans la base (reference ONTP)")
 
     print("Reinitialisation des gardes (tout le monde a false)...")
     reinitialiser_gardes()
 
-    trouvees, non_trouvees = 0, 0
+    trouvees, non_trouvees, erreurs = 0, 0, 0
     for entree in entrees:
-        pharmacie, methode = trouver_correspondance(entree["nom_brut"], pharmacies_db)
+        try:
+            pharmacie, methode = trouver_correspondance(entree["nom_brut"], pharmacies_db)
 
-        if pharmacie:
-            marquer_de_garde(pharmacie["id"])
-            if semaine_debut and semaine_fin:
-                enregistrer_historique(pharmacie["id"], semaine_debut, semaine_fin)
-            trouvees += 1
-            if methode != "exacte":
-                print(f"  [{methode}] '{entree['nom_brut']}' -> '{pharmacie['nom']}'")
-        else:
-            logguer_non_reconnue(entree, semaine_debut)
-            non_trouvees += 1
-            print(f"  [NON RECONNUE] '{entree['nom_brut']}' -- possible nouvelle pharmacie a ajouter")
+            if pharmacie:
+                marquer_de_garde(pharmacie["id"])
+                if semaine_debut and semaine_fin:
+                    enregistrer_historique(pharmacie["id"], semaine_debut, semaine_fin)
+                trouvees += 1
+                if methode != "exacte":
+                    print(f"  [{methode}] '{entree['nom_brut']}' -> '{pharmacie['nom']}'")
+            else:
+                logguer_non_reconnue(entree, semaine_debut)
+                non_trouvees += 1
+                print(f"  [NON RECONNUE] '{entree['nom_brut']}' -- possible nouvelle pharmacie a ajouter")
+        except Exception as exc:
+            # Une pharmacie qui pose probleme ne doit jamais faire
+            # planter tout le lot -- on note l'erreur et on continue.
+            erreurs += 1
+            print(f"  [ERREUR ISOLEE] '{entree['nom_brut']}' -- {exc}")
 
     print()
-    print(f"Termine : {trouvees} associees, {non_trouvees} non reconnues.")
+    print(f"Termine : {trouvees} associees, {non_trouvees} non reconnues, {erreurs} erreurs isolees.")
+    if erreurs > 0:
+        print("-> Des erreurs sont survenues sur certaines pharmacies, mais le reste du lot a ete traite normalement.")
     if non_trouvees > 0:
         print("-> Va voir la table pharmacies_non_reconnues dans Supabase.")
         print("   Chaque ligne restante est probablement une pharmacie absente")
