@@ -4,17 +4,43 @@ Source : https://www.inam.tg/pharmacies-de-garde/
 
 Ce script :
   1. Lit le tableau des pharmacies de garde sur inam.tg
-  2. Fait correspondre chaque nom a une pharmacie deja presente dans
-     la table `pharmacies` (277 pharmacies importees depuis l'ONTP),
+  2. S'arrete tout de suite si la semaine affichee est DEJA en base
+     (voir "Pourquoi un arret precoce" plus bas)
+  3. Fait correspondre chaque nom a une pharmacie deja presente dans
+     la table `pharmacies` (~277 pharmacies importees depuis l'ONTP),
      avec plusieurs strategies de comparaison pour minimiser les ratés
-  3. Met a jour est_de_garde + gardes_historique pour les correspondances
-  4. Loggue dans pharmacies_non_reconnues uniquement les VRAIS cas
+  4. Met a jour est_de_garde + gardes_historique pour les correspondances
+  5. Loggue dans pharmacies_non_reconnues uniquement les VRAIS cas
      ou aucune pharmacie proche n'existe deja (probable nouvelle pharmacie
      a ajouter manuellement, ou faute de frappe trop importante sur inam.tg)
+
+Pourquoi un arret precoce
+-------------------------
+La liste ne change qu'une fois par semaine, mais le workflow passe toutes
+les heures les dimanche/lundi/mardi (on ne sait pas quand INAM publie).
+Sans garde-fou, c'est ~72 passages qui refont le meme travail. On compare
+donc la periode lue sur la page a ce qui est deja dans gardes_historique :
+si c'est la meme semaine, on sort immediatement sans rien ecrire.
+
+Pourquoi on ne remet pas les gardes a zero tout de suite
+--------------------------------------------------------
+L'ancienne version faisait `est_de_garde = false` PARTOUT avant de
+commencer les correspondances. Si le script s'interrompait ensuite (coupure
+reseau, INAM qui repond a moitie), la base restait avec une liste de garde
+vide ou tronquee -- c'est-a-dire une app qui affiche "aucune pharmacie de
+garde" un dimanche soir, le pire cas possible. Desormais on calcule TOUTES
+les correspondances d'abord, on verifie qu'elles sont plausibles, et on
+n'ecrit qu'a la fin.
 
 Variables d'environnement requises (fournies par GitHub Actions secrets) :
   SUPABASE_URL          ex: https://xxxxx.supabase.co
   SUPABASE_SERVICE_KEY  la cle "service_role" / "secret" (jamais la cle publique)
+
+Options :
+  --force     ignore l'arret precoce et retraite la semaine meme si elle
+              est deja en base (utile apres avoir ajoute des pharmacies
+              manquantes dans `pharmacies`)
+  --dry-run   analyse et affiche le rapport, sans RIEN ecrire en base
 """
 
 import difflib
@@ -22,7 +48,7 @@ import os
 import re
 import sys
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 
 import cloudscraper
 import requests
@@ -38,6 +64,15 @@ HEADERS = {
 }
 
 INAM_URL = "https://www.inam.tg/pharmacies-de-garde/"
+
+FORCE = "--force" in sys.argv
+DRY_RUN = "--dry-run" in sys.argv
+
+# Si la nouvelle liste represente moins que cette fraction de la semaine
+# precedente, on considere que quelque chose a mal tourne (page tronquee,
+# format modifie) et on n'ecrit rien. Ex: 53 pharmacies la semaine derniere
+# et 12 cette semaine -> suspect, on s'arrete.
+FRACTION_MINIMALE = 0.5
 
 MOIS_FR = {
     "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4,
@@ -93,11 +128,14 @@ def mots_significatifs(nom):
 # Correspondance en plusieurs passes
 # ------------------------------------------------------------------
 
-def trouver_correspondance(nom_brut, pharmacies_db):
+def trouver_correspondance(nom_brut, pharmacies_db, index_sans_prefixe):
     """Essaie plusieurs strategies dans l'ordre, de la plus stricte a la
     plus permissive. Retourne (pharmacie, methode) ou (None, None).
 
-    pharmacies_db : liste de dicts {id, nom, nom_normalise}
+    pharmacies_db      : liste de dicts {id, nom, nom_normalise}
+    index_sans_prefixe : {nom_normalise_sans_prefixe: pharmacie}, calcule
+                         une seule fois par le programme principal (le
+                         reconstruire a chaque appel etait inutilement lourd)
     """
     cle = normaliser(nom_brut)
     mots_cherches = mots_significatifs(nom_brut)
@@ -111,13 +149,11 @@ def trouver_correspondance(nom_brut, pharmacies_db):
     # On compare sans le mot "PHARMACIE" pour ne pas fausser le score de
     # ressemblance entre deux pharmacies par ailleurs sans rapport.
     cle_sans_prefixe = normaliser_sans_prefixe(nom_brut)
-    index = {
-        normaliser_sans_prefixe(p["nom"]): p
-        for p in pharmacies_db if p.get("nom_normalise")
-    }
-    candidats = difflib.get_close_matches(cle_sans_prefixe, index.keys(), n=1, cutoff=0.60)
+    candidats = difflib.get_close_matches(
+        cle_sans_prefixe, index_sans_prefixe.keys(), n=1, cutoff=0.60
+    )
     if candidats:
-        return index[candidats[0]], "floue"
+        return index_sans_prefixe[candidats[0]], "floue"
 
     # Passe 3 : correspondance par mots-cles communs (ex: "ST PIERRE" vs
     # "SAINT PIERRE ANNEXE" -> au moins tous les mots significatifs de
@@ -158,31 +194,62 @@ def recuperer_page_inam():
     }
     resp = scraper.get(INAM_URL, timeout=30, headers=headers)
     resp.raise_for_status()
+    # INAM ne declare pas de charset alors que ses pages sont en UTF-8 :
+    # sans cette ligne les accents arrivent casses ("DÃ©kon").
+    resp.encoding = "utf-8"
     return BeautifulSoup(resp.text, "html.parser")
 
 
 def extraire_periode(soup):
-    """Cherche un texte du type 'du 20 au 27 juillet 2026' sur la page."""
+    """Lit la periode de garde affichee, ex. "Liste des pharmacies du 24 au
+    31 août 2026" -> (date(2026,8,24), date(2026,8,31)).
+
+    Gere les trois formulations rencontrees :
+      - meme mois        "du 24 au 31 août 2026"
+      - deux mois        "du 31 août au 6 septembre 2026"
+      - deux annees      "du 28 décembre 2026 au 3 janvier 2027"
+
+    Le "au" est OBLIGATOIRE dans le motif. C'est ce qui evite de confondre
+    la periode avec les adresses de la page ("Boulevard du 13 Janvier",
+    "bd du 30 Août") : l'ancienne version rendait "au" optionnel et pouvait
+    attraper n'importe quel "du <nombre> <mot> <annee>".
+    """
     texte = soup.get_text(" ", strip=True)
-    m = re.search(
-        r"du\s+(\d{1,2})\s*(?:au)?\s*(?:(\d{1,2})\s+)?(\w+)\s+(\d{4})",
-        texte, re.IGNORECASE,
+    motif = re.compile(
+        r"du\s+(\d{1,2})"                 # jour de debut
+        r"(?:\s+([A-Za-zéèûôàç]+))?"      # mois de debut (absent si meme mois)
+        r"(?:\s+(\d{4}))?"                # annee de debut (absente si meme annee)
+        r"\s+au\s+(\d{1,2})"              # jour de fin
+        r"\s+([A-Za-zéèûôàç]+)"           # mois de fin
+        r"\s+(\d{4})",                    # annee de fin
+        re.IGNORECASE,
     )
-    if not m:
-        return None, None
-    jour_debut = int(m.group(1))
-    jour_fin = int(m.group(2)) if m.group(2) else jour_debut
-    mois_nom = m.group(3).lower()
-    annee = int(m.group(4))
-    mois = MOIS_FR.get(mois_nom)
-    if not mois:
-        return None, None
-    try:
-        debut = datetime(annee, mois, jour_debut).date()
-        fin = datetime(annee, mois, jour_fin).date()
-    except ValueError:
-        return None, None
-    return debut, fin
+    for m in motif.finditer(texte):
+        jour_debut, mois_debut_nom, annee_debut, jour_fin, mois_fin_nom, annee_fin = m.groups()
+
+        mois_fin = MOIS_FR.get(mois_fin_nom.lower())
+        if not mois_fin:
+            continue  # "du 5 au 12 machin 2026" -> pas une periode, on continue
+        mois_debut = MOIS_FR.get((mois_debut_nom or "").lower()) or mois_fin
+
+        annee_fin = int(annee_fin)
+        if annee_debut:
+            annee_debut = int(annee_debut)
+        elif mois_debut > mois_fin:
+            # "du 28 décembre au 3 janvier 2027" -> le debut est l'annee d'avant
+            annee_debut = annee_fin - 1
+        else:
+            annee_debut = annee_fin
+
+        try:
+            debut = datetime(annee_debut, mois_debut, int(jour_debut)).date()
+            fin = datetime(annee_fin, mois_fin, int(jour_fin)).date()
+        except ValueError:
+            continue  # date impossible (31 février...) -> ce n'etait pas la periode
+        if fin < debut:
+            continue
+        return debut, fin
+    return None, None
 
 
 def extraire_pharmacies_de_garde(soup):
@@ -213,66 +280,118 @@ def recuperer_pharmacies_existantes():
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/pharmacies",
         headers=HEADERS,
-        params={"select": "id,nom,nom_normalise"},
+        params={"select": "id,nom,nom_normalise", "limit": "5000"},
         timeout=30,
     )
     r.raise_for_status()
     return r.json()
 
 
-def reinitialiser_gardes():
-    r = requests.patch(
-        f"{SUPABASE_URL}/rest/v1/pharmacies",
-        headers=HEADERS,
-        params={"id": "gt.0"},
-        json={"est_de_garde": False},
-        timeout=30,
-    )
-    r.raise_for_status()
-
-
-def marquer_de_garde(pharmacie_id):
-    r = requests.patch(
-        f"{SUPABASE_URL}/rest/v1/pharmacies",
-        headers=HEADERS,
-        params={"id": f"eq.{pharmacie_id}"},
-        json={
-            "est_de_garde": True,
-            "derniere_maj_garde": datetime.utcnow().isoformat(),
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-
-
-def enregistrer_historique(pharmacie_id, semaine_debut, semaine_fin):
-    r = requests.post(
+def derniere_semaine_en_base():
+    """(semaine_debut, semaine_fin, nombre_de_pharmacies) de la periode la
+    plus recente deja enregistree, ou (None, None, 0) si la table est vide.
+    Sert a l'arret precoce et au controle de vraisemblance."""
+    r = requests.get(
         f"{SUPABASE_URL}/rest/v1/gardes_historique",
-        headers={**HEADERS, "Prefer": "resolution=merge-duplicates"},
-        params={"on_conflict": "pharmacie_id,semaine_debut"},  # sans ca, merge-duplicates
-                                                                 # ne sait pas quelle contrainte
-                                                                 # utiliser et Postgres refuse (409)
-        json={
-            "pharmacie_id": pharmacie_id,
-            "semaine_debut": semaine_debut.isoformat(),
-            "semaine_fin": semaine_fin.isoformat(),
-            "source": "inam.tg",
+        headers=HEADERS,
+        params={
+            "select": "semaine_debut,semaine_fin",
+            "order": "semaine_debut.desc",
+            "limit": "1",
         },
         timeout=30,
     )
     r.raise_for_status()
+    lignes = r.json()
+    if not lignes:
+        return None, None, 0
+    debut, fin = lignes[0]["semaine_debut"], lignes[0]["semaine_fin"]
+    # Compte les pharmacies de cette semaine-la (Prefer: count=exact renvoie
+    # le total dans l'en-tete Content-Range, sans telecharger les lignes).
+    r2 = requests.get(
+        f"{SUPABASE_URL}/rest/v1/gardes_historique",
+        headers={**HEADERS, "Prefer": "count=exact"},
+        params={"select": "id", "semaine_debut": f"eq.{debut}", "limit": "1"},
+        timeout=30,
+    )
+    r2.raise_for_status()
+    total = 0
+    plage = r2.headers.get("Content-Range", "")
+    if "/" in plage:
+        try:
+            total = int(plage.split("/")[1])
+        except ValueError:
+            total = 0
+    return debut, fin, total
 
 
-def logguer_non_reconnue(entree, semaine_debut):
+def appliquer_gardes(ids_de_garde, semaine_debut, semaine_fin):
+    """Ecrit la nouvelle liste de garde en 3 requetes groupees au lieu de
+    deux par pharmacie (l'ancienne version faisait ~106 appels HTTP pour
+    53 pharmacies, autant d'occasions d'echouer a mi-parcours)."""
+    maintenant = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+
+    # 1. Tout le monde a false
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/pharmacies",
+        headers=HEADERS,
+        params={"est_de_garde": "is.true"},
+        json={"est_de_garde": False},
+        timeout=60,
+    )
+    r.raise_for_status()
+
+    if not ids_de_garde:
+        return
+
+    # 2. Les pharmacies de garde a true, en un seul appel
+    liste = ",".join(str(i) for i in ids_de_garde)
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/pharmacies",
+        headers=HEADERS,
+        params={"id": f"in.({liste})"},
+        json={"est_de_garde": True, "derniere_maj_garde": maintenant},
+        timeout=60,
+    )
+    r.raise_for_status()
+
+    # 3. Historique, en un seul upsert groupe
+    if semaine_debut and semaine_fin:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/gardes_historique",
+            headers={**HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            # sans on_conflict, merge-duplicates ne sait pas quelle
+            # contrainte utiliser et Postgres refuse (409)
+            params={"on_conflict": "pharmacie_id,semaine_debut"},
+            json=[
+                {
+                    "pharmacie_id": pid,
+                    "semaine_debut": semaine_debut.isoformat(),
+                    "semaine_fin": semaine_fin.isoformat(),
+                    "source": "inam.tg",
+                }
+                for pid in ids_de_garde
+            ],
+            timeout=60,
+        )
+        r.raise_for_status()
+
+
+def logguer_non_reconnues(entrees, semaine_debut):
+    if not entrees:
+        return
     r = requests.post(
         f"{SUPABASE_URL}/rest/v1/pharmacies_non_reconnues",
-        headers=HEADERS,
-        json={
-            "nom_brut": entree["nom_brut"],
-            "telephone_brut": entree["telephone_brut"],
-            "emplacement_brut": entree["emplacement_brut"],
-            "semaine_debut": semaine_debut.isoformat() if semaine_debut else None,
-        },
+        headers={**HEADERS, "Prefer": "return=minimal"},
+        json=[
+            {
+                "nom_brut": e["nom_brut"],
+                "telephone_brut": e["telephone_brut"],
+                "emplacement_brut": e["emplacement_brut"],
+                "semaine_debut": semaine_debut.isoformat() if semaine_debut else None,
+            }
+            for e in entrees
+        ],
         timeout=30,
     )
     r.raise_for_status()
@@ -289,55 +408,87 @@ def main():
     semaine_debut, semaine_fin = extraire_periode(soup)
     print(f"Periode detectee : {semaine_debut} -> {semaine_fin}")
 
+    # La periode est indispensable : sans elle, on marquerait les nouvelles
+    # gardes sans mettre a jour l'historique, et l'app afficherait la liste
+    # de cette semaine sous le titre de la semaine derniere.
+    if not semaine_debut or not semaine_fin:
+        print("ERREUR : periode 'du ... au ...' introuvable sur la page.")
+        print("-> Formulation probablement modifiee. Arret, aucune donnee touchee.")
+        sys.exit(1)
+
+    dernier_debut, dernier_fin, dernier_total = derniere_semaine_en_base()
+    print(f"Derniere semaine en base : {dernier_debut} -> {dernier_fin} ({dernier_total} pharmacies)")
+
+    # Arret precoce : rien de nouveau a faire.
+    if dernier_debut == semaine_debut.isoformat() and not FORCE:
+        print("Cette semaine est deja enregistree -> rien a faire.")
+        print("   (utiliser --force pour la retraiter malgre tout)")
+        return
+
     entrees = extraire_pharmacies_de_garde(soup)
     print(f"{len(entrees)} pharmacies de garde trouvees sur inam.tg")
 
-    # Garde-fou : seulement si la page ne renvoie STRICTEMENT rien
-    # (0 pharmacie). Un petit nombre (meme 5, 10...) peut etre une
-    # vraie semaine calme -- on ne bloque jamais sur ca, seulement
-    # sur une liste totalement vide, signe quasi certain d'un
-    # changement de format cote INAM.
     if len(entrees) == 0:
         print("ERREUR : aucune pharmacie trouvee sur la page INAM.")
-        print("-> Le format de la page a peut-etre change. Arret par securite, aucune donnee modifiee.")
+        print("-> Le format de la page a peut-etre change. Arret, aucune donnee modifiee.")
+        sys.exit(1)
+
+    # Controle de vraisemblance : une chute brutale du nombre de pharmacies
+    # est presque toujours le signe d'une page tronquee, pas d'une vraie
+    # semaine calme.
+    if dernier_total and len(entrees) < dernier_total * FRACTION_MINIMALE:
+        print(f"ERREUR : {len(entrees)} pharmacies contre {dernier_total} la semaine derniere.")
+        print("-> Chute suspecte. Arret par securite, aucune donnee modifiee.")
         sys.exit(1)
 
     pharmacies_db = recuperer_pharmacies_existantes()
     print(f"{len(pharmacies_db)} pharmacies dans la base (reference ONTP)")
 
-    print("Reinitialisation des gardes (tout le monde a false)...")
-    reinitialiser_gardes()
+    # Index construit une seule fois (et non a chaque nom cherche).
+    index_sans_prefixe = {
+        normaliser_sans_prefixe(p["nom"]): p
+        for p in pharmacies_db if p.get("nom_normalise")
+    }
 
-    trouvees, non_trouvees, erreurs = 0, 0, 0
+    # --- Phase 1 : on calcule TOUT, sans rien ecrire ---
+    ids_de_garde, non_reconnues = [], []
     for entree in entrees:
-        try:
-            pharmacie, methode = trouver_correspondance(entree["nom_brut"], pharmacies_db)
-
-            if pharmacie:
-                marquer_de_garde(pharmacie["id"])
-                if semaine_debut and semaine_fin:
-                    enregistrer_historique(pharmacie["id"], semaine_debut, semaine_fin)
-                trouvees += 1
-                if methode != "exacte":
-                    print(f"  [{methode}] '{entree['nom_brut']}' -> '{pharmacie['nom']}'")
-            else:
-                logguer_non_reconnue(entree, semaine_debut)
-                non_trouvees += 1
-                print(f"  [NON RECONNUE] '{entree['nom_brut']}' -- possible nouvelle pharmacie a ajouter")
-        except Exception as exc:
-            # Une pharmacie qui pose probleme ne doit jamais faire
-            # planter tout le lot -- on note l'erreur et on continue.
-            erreurs += 1
-            print(f"  [ERREUR ISOLEE] '{entree['nom_brut']}' -- {exc}")
+        pharmacie, methode = trouver_correspondance(
+            entree["nom_brut"], pharmacies_db, index_sans_prefixe
+        )
+        if pharmacie:
+            if pharmacie["id"] not in ids_de_garde:
+                ids_de_garde.append(pharmacie["id"])
+            if methode != "exacte":
+                print(f"  [{methode}] '{entree['nom_brut']}' -> '{pharmacie['nom']}'")
+        else:
+            non_reconnues.append(entree)
+            print(f"  [NON RECONNUE] '{entree['nom_brut']}' -- possible nouvelle pharmacie a ajouter")
 
     print()
-    print(f"Termine : {trouvees} associees, {non_trouvees} non reconnues, {erreurs} erreurs isolees.")
-    if erreurs > 0:
-        print("-> Des erreurs sont survenues sur certaines pharmacies, mais le reste du lot a ete traite normalement.")
-    if non_trouvees > 0:
+    print(f"{len(ids_de_garde)} associees, {len(non_reconnues)} non reconnues")
+
+    if not ids_de_garde:
+        print("ERREUR : aucune correspondance trouvee.")
+        print("-> Les noms sur inam.tg ne correspondent plus du tout a la base.")
+        print("   Arret par securite : l'ancienne liste de garde est conservee.")
+        sys.exit(1)
+
+    if DRY_RUN:
+        print("\n--- MODE TEST : rien n'est ecrit en base ---")
+        return
+
+    # --- Phase 2 : ecriture, seulement maintenant que tout est verifie ---
+    print("Application en base...")
+    appliquer_gardes(ids_de_garde, semaine_debut, semaine_fin)
+    logguer_non_reconnues(non_reconnues, semaine_debut)
+
+    print(f"\nTermine : semaine du {semaine_debut} au {semaine_fin}, "
+          f"{len(ids_de_garde)} pharmacies de garde.")
+    if non_reconnues:
         print("-> Va voir la table pharmacies_non_reconnues dans Supabase.")
-        print("   Chaque ligne restante est probablement une pharmacie absente")
-        print("   de la liste ONTP initiale -- a ajouter manuellement dans `pharmacies`.")
+        print("   Chaque ligne est probablement une pharmacie absente de la")
+        print("   liste ONTP initiale -- a ajouter manuellement dans `pharmacies`.")
 
 
 if __name__ == "__main__":

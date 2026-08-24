@@ -1,0 +1,39 @@
+name: Maj mensuelle catalogue medicaments
+
+on:
+  schedule:
+    # Le 2 de chaque mois a 03h00 UTC. Une seule fois par mois suffit :
+    # le catalogue INAM bouge rarement (nouveaux medicaments, revision de
+    # prix), et le script est un upsert -- il ajoute ou met a jour, il ne
+    # supprime jamais.
+    #
+    # Pourquoi le 2 et pas le 1er : les runners GitHub sont satures aux
+    # heures rondes du 1er du mois (tous les crons mensuels du monde
+    # partent en meme temps) et les jobs sont mis en file d'attente,
+    # parfois plus d'une heure.
+    - cron: "0 3 2 * *"
+  workflow_dispatch: {}   # bouton "Run workflow" sur GitHub, pour lancer a la main
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # La page fait ~25 Mo et contient 14 000 lignes a analyser : on laisse
+    # de la marge, mais on coupe si ca part en boucle.
+    timeout-minutes: 30
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dependances
+        run: pip install requests beautifulsoup4 cloudscraper
+
+      - name: Lancer le scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scraper_medicaments.py

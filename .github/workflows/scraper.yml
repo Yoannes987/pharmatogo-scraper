@@ -2,16 +2,26 @@ name: Maj hebdo pharmacies de garde
 
 on:
   schedule:
-    # Scan chaque heure, du dimanche au mardi, pour ne jamais rater
-    # la publication de la nouvelle semaine par l'INAM (l'heure exacte
-    # n'est pas garantie de leur cote). Sans risque de repetition : le
-    # script ne fait que confirmer si rien n'a change.
+    # Scan chaque heure, du dimanche au mardi : l'INAM ne publie pas la
+    # nouvelle semaine a heure fixe, donc on regarde souvent.
+    #
+    # Ce n'est pas du gaspillage : depuis la version 2 du script, un
+    # passage ou rien n'a change coute 2 requetes HTTP et s'arrete tout
+    # seul ("Cette semaine est deja enregistree -> rien a faire"). Le
+    # travail complet (analyse des 50+ noms, ecriture en base) n'a lieu
+    # que le passage ou la periode affichee sur inam.tg change.
     - cron: "0 * * * 0,1,2"
-  workflow_dispatch: {}   # permet de lancer le scraper manuellement depuis GitHub, pour tester
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Retraiter la semaine meme si elle est deja en base"
+        type: boolean
+        default: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Recuperer le code
         uses: actions/checkout@v4
@@ -28,4 +38,8 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python scraper_gardes.py
+          # --force est ajoute seulement si la case a ete cochee lors d'un
+          # lancement manuel. Utile apres avoir ajoute a la main une
+          # pharmacie qui manquait dans la table `pharmacies`.
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: python scraper_gardes.py $FORCE
