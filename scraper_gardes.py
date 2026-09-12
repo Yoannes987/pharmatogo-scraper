@@ -75,9 +75,18 @@ DRY_RUN = "--dry-run" in sys.argv
 FRACTION_MINIMALE = 0.5
 
 MOIS_FR = {
-    "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4,
-    "mai": 5, "juin": 6, "juillet": 7, "août": 8, "aout": 8,
-    "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12,
+    "janvier": 1, "janv": 1,
+    "février": 2, "fevrier": 2, "févr": 2, "fevr": 2,
+    "mars": 3,
+    "avril": 4, "avr": 4,
+    "mai": 5,
+    "juin": 6,
+    "juillet": 7, "juil": 7,
+    "août": 8, "aout": 8,
+    "septembre": 9, "sept": 9,
+    "octobre": 10, "oct": 10,
+    "novembre": 11, "nov": 11,
+    "décembre": 12, "decembre": 12, "déc": 12, "dec": 12,
 }
 
 # Mots qu'on ignore quand on compare deux noms par mots-cles
