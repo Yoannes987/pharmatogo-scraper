@@ -310,6 +310,23 @@ def main():
     avec_taux = sum(1 for m in medicaments if m["taux_prise_en_charge"] is not None)
     print(f"  dont {avec_prix} avec prix et {avec_taux} avec taux de prise en charge")
 
+      # Garde-fou n2 : le nombre de medicaments peut rester correct meme si
+    # INAM renomme un libelle de champ ("Prix Public" -> autre chose). Dans
+    # ce cas c(...) ne trouve plus rien et prix_public devient None pour
+    # (presque) tout le monde, SANS faire baisser le total -- le garde-fou
+    # ci-dessus ne le detecterait pas. On verifie donc aussi le taux de
+    # couverture des prix, pas seulement le compte total.
+    SEUIL_COUVERTURE_PRIX = 0.90  # constate le 2026-08-24 : ~99% ont un prix
+    taux_couverture = avec_prix / len(medicaments)
+    if taux_couverture < SEUIL_COUVERTURE_PRIX:
+        print(
+            f"ERREUR : seulement {taux_couverture:.0%} des medicaments ont un prix "
+            f"(seuil {SEUIL_COUVERTURE_PRIX:.0%})."
+        )
+        print("-> Le libelle 'Prix Public' a probablement change sur la page INAM.")
+        print("-> Arret, aucune donnee touchee.")
+        sys.exit(1)
+
     if DRY_RUN:
         print("\n--- MODE TEST : rien n'est ecrit en base ---")
         for m in medicaments[:3]:
