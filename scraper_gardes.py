@@ -48,7 +48,7 @@ import os
 import re
 import sys
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import cloudscraper
 import requests
@@ -420,16 +420,20 @@ def main():
     # La periode est indispensable : sans elle, on marquerait les nouvelles
     # gardes sans mettre a jour l'historique, et l'app afficherait la liste
     # de cette semaine sous le titre de la semaine derniere.
+    periode_incertaine = False
     if not semaine_debut or not semaine_fin:
-        print("ERREUR : periode 'du ... au ...' introuvable sur la page.")
-        print("-> Formulation probablement modifiee. Arret, aucune donnee touchee.")
-        sys.exit(1)
+        print("AVERTISSEMENT : periode 'du ... au ...' introuvable sur la page.")
+        print("-> Formulation probablement modifiee. On continue quand meme avec une date estimee.")
+        aujourdhui = datetime.now().date()
+        semaine_debut = aujourdhui - timedelta(days=aujourdhui.weekday())
+        semaine_fin = semaine_debut + timedelta(days=6)
+        periode_incertaine = True
 
     dernier_debut, dernier_fin, dernier_total = derniere_semaine_en_base()
     print(f"Derniere semaine en base : {dernier_debut} -> {dernier_fin} ({dernier_total} pharmacies)")
 
     # Arret precoce : rien de nouveau a faire.
-    if dernier_debut == semaine_debut.isoformat() and not FORCE:
+    if dernier_debut == semaine_debut.isoformat() and not FORCE and not periode_incertaine:
         print("Cette semaine est deja enregistree -> rien a faire.")
         print("   (utiliser --force pour la retraiter malgre tout)")
         return
