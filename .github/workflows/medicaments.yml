@@ -2,16 +2,16 @@ name: Maj mensuelle catalogue medicaments
 
 on:
   schedule:
-    # Le 2 de chaque mois a 03h00 UTC. Une seule fois par mois suffit :
-    # le catalogue INAM bouge rarement (nouveaux medicaments, revision de
-    # prix), et le script est un upsert -- il ajoute ou met a jour, il ne
-    # supprime jamais.
+    # Le 5 du mois a 21h17 UTC (= 21h17 a Lome, meme heure). Le 5 est un jour
+    # de paie : c'est la que l'INAM a le plus de chances de publier. Le soir,
+    # apres les heures de bureau, on capte une mise a jour faite dans la
+    # journee, et le site est peu charge.
     #
-    # Pourquoi le 2 et pas le 1er : les runners GitHub sont satures aux
-    # heures rondes du 1er du mois (tous les crons mensuels du monde
-    # partent en meme temps) et les jobs sont mis en file d'attente,
-    # parfois plus d'une heure.
-    - cron: "0 3 2 * *"
+    # Reconfirmation les 6, 7 et 10 : le script ne retient que ce qui a
+    # change. Si l'INAM a deja publie, les passages suivants disent
+    # "catalogue deja a jour" et ne touchent a rien. S'il publie en retard,
+    # on le rattrape. (:17 et non :00 -> les heures rondes sont saturees.)
+    - cron: "17 21 5,6,7,10 * *"
   workflow_dispatch: {}   # bouton "Run workflow" sur GitHub, pour lancer a la main
 
 jobs:

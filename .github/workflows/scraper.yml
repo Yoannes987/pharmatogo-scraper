@@ -2,7 +2,8 @@ name: Maj hebdo pharmacies de garde
 
 on:
   schedule:
-    # Scan chaque heure, du dimanche au mardi : l'INAM ne publie pas la
+    # Scan chaque heure (a H:07, les heures rondes sont saturees chez GitHub),
+    # du dimanche au mardi : l'INAM ne publie pas la
     # nouvelle semaine a heure fixe, donc on regarde souvent.
     #
     # Ce n'est pas du gaspillage : depuis la version 2 du script, un
@@ -10,7 +11,11 @@ on:
     # seul ("Cette semaine est deja enregistree -> rien a faire"). Le
     # travail complet (analyse des 50+ noms, ecriture en base) n'a lieu
     # que le passage ou la periode affichee sur inam.tg change.
-    - cron: "0 * * * 0,1,2"
+    - cron: "7 * * * 0,1,2"
+    # Reconfirmation en milieu de semaine : si l'INAM publie en retard, on
+    # le rattrape mercredi/jeudi (toutes les 3 h). Si la semaine est deja
+    # enregistree, chaque passage s'arrete apres 2 requetes : tout est normal.
+    - cron: "7 */3 * * 3,4"
   workflow_dispatch:
     inputs:
       force:
