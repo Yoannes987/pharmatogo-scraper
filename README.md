@@ -69,10 +69,11 @@ script s'arrete si le resultat est suspect :
 
 | Situation | Reaction |
 |---|---|
-| Aucune periode "du ... au ..." trouvee | Arret, rien n'est ecrit |
+| Aucune periode "du ... au ..." lisible | On continue avec une date estimee, le journal affiche le texte de la page |
 | 0 pharmacie dans le tableau | Arret, rien n'est ecrit |
 | Moitie moins de pharmacies que la semaine derniere | Arret, rien n'est ecrit |
 | Aucun nom ne correspond a la base | Arret, l'ancienne liste est gardee |
+| Moins de la moitie des pharmacies actuellement de garde | Arret, rien n'est ecrit |
 | Moins de 3500 medicaments extraits | Arret, rien n'est ecrit |
 | Moins de 90 % des medicaments avec un prix | Arret, rien n'est ecrit |
 

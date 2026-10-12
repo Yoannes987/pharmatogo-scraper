@@ -209,55 +209,138 @@ def recuperer_page_inam():
     return BeautifulSoup(resp.text, "html.parser")
 
 
+def _nettoyer_texte(texte):
+    """Rend le texte de la page 'propre' avant toute recherche : supprime les
+    caracteres invisibles (espace de largeur nulle, trait d'union mou, BOM),
+    transforme les espaces insecables en espaces normaux et fusionne les
+    espaces multiples. Un seul caractere invisible entre '12' et 'au' suffit
+    sinon a faire rater la detection de la periode."""
+    texte = re.sub(r"[\u200b\u200c\u200d\u2060\ufeff\u00ad]", "", texte)
+    texte = texte.replace("\xa0", " ").replace("\u202f", " ")
+    return re.sub(r"\s+", " ", texte)
+
+
+def _sans_accents_minuscules(mot):
+    return unicodedata.normalize("NFKD", mot).encode("ascii", "ignore").decode("ascii").lower().strip(". ")
+
+
+_MOIS_NORMALISES = {_sans_accents_minuscules(k): v for k, v in MOIS_FR.items()}
+
+
+def _numero_mois(mot):
+    """'octobre' / 'Octobre' / 'oct.' / 'OCT' / 'févr' -> numero du mois,
+    ou None si ce n'est pas un mois."""
+    m = _sans_accents_minuscules(mot or "")
+    if not m:
+        return None
+    if m in _MOIS_NORMALISES:
+        return _MOIS_NORMALISES[m]
+    if len(m) >= 3:  # abreviation : on accepte un debut de nom de mois
+        candidats = {v for k, v in _MOIS_NORMALISES.items() if len(k) > 3 and k.startswith(m)}
+        if len(candidats) == 1:
+            return candidats.pop()
+    return None
+
+
+# "du 12 au 19 octobre 2026", "du 1er au 8 nov.", "du 31 août au 6 septembre 2026",
+# "du 28 décembre 2026 au 3 janvier 2027", "Du 12 a 19 Octobre" (annee facultative)
+_MOTIF_PERIODE = re.compile(
+    r"\bdu\s+(\d{1,2})\s*(?:er|e)?"          # jour de debut (12, 1er)
+    r"(?:\s+([^\W\d_]+)\.?)?"                  # mois de debut (absent si meme mois)
+    r"(?:\s+(\d{4}))?"                          # annee de debut (facultative)
+    r"\s+(?:au|a|\u00e0)\s+(\d{1,2})\s*(?:er|e)?"  # separateur + jour de fin
+    r"\s+([^\W\d_]+)\.?"                       # mois de fin
+    r"(?:\s+(\d{4}))?",                         # annee de fin (facultative)
+    re.IGNORECASE,
+)
+
+# Variante numerique : "du 12/10/2026 au 19/10/2026"
+_MOTIF_PERIODE_NUM = re.compile(
+    r"\bdu\s+(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})\s+au\s+(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})",
+    re.IGNORECASE,
+)
+
+
+def _periode_valide(debut, fin):
+    # Une periode de garde dure environ une semaine. Refuser tout ce qui est
+    # hors de 1-14 jours evite de prendre une adresse ("Boulevard du 13
+    # Janvier au ...") pour la periode.
+    return 1 <= (fin - debut).days <= 14
+
+
 def extraire_periode(soup):
-    """Lit la periode de garde affichee, ex. "Liste des pharmacies du 24 au
-    31 août 2026" -> (date(2026,8,24), date(2026,8,31)).
+    """Lit la periode de garde affichee, ex. "Liste des pharmacies du 12 au
+    19 octobre 2026" -> (date(2026,10,12), date(2026,10,19)).
 
-    Gere les trois formulations rencontrees :
-      - meme mois        "du 24 au 31 août 2026"
-      - deux mois        "du 31 août au 6 septembre 2026"
-      - deux annees      "du 28 décembre 2026 au 3 janvier 2027"
+    Tolerant : accents ou non, majuscules ou minuscules, mois abrege
+    ("oct."), "1er", annee absente, caracteres invisibles, espaces
+    insecables, balises collees entre les mots. Le "au" reste obligatoire
+    (c'est ce qui evite de confondre avec "Bd du 13 Janvier"), et la duree
+    doit etre de 1 a 14 jours.
 
-    Le "au" est OBLIGATOIRE dans le motif. C'est ce qui evite de confondre
-    la periode avec les adresses de la page ("Boulevard du 13 Janvier",
-    "bd du 30 Août") : l'ancienne version rendait "au" optionnel et pouvait
-    attraper n'importe quel "du <nombre> <mot> <annee>".
+    Si rien n'est trouve, affiche dans le journal le morceau de texte autour
+    de "pharmacies du" : la prochaine fois qu'INAM change sa phrase, on la
+    voit tout de suite dans les logs au lieu de deviner.
     """
-    texte = soup.get_text(" ", strip=True)
-    motif = re.compile(
-        r"du\s+(\d{1,2})"                 # jour de debut
-        r"(?:\s+([A-Za-zéèûôàç]+))?"      # mois de debut (absent si meme mois)
-        r"(?:\s+(\d{4}))?"                # annee de debut (absente si meme annee)
-        r"\s+au\s+(\d{1,2})"              # jour de fin
-        r"\s+([A-Za-zéèûôàç]+)"           # mois de fin
-        r"\s+(\d{4})",                    # annee de fin
-        re.IGNORECASE,
-    )
-    for m in motif.finditer(texte):
+    texte = _nettoyer_texte(soup.get_text(" ", strip=True))
+    aujourdhui = datetime.now(timezone.utc).date()
+
+    for m in _MOTIF_PERIODE.finditer(texte):
         jour_debut, mois_debut_nom, annee_debut, jour_fin, mois_fin_nom, annee_fin = m.groups()
-
-        mois_fin = MOIS_FR.get(mois_fin_nom.lower())
+        mois_fin = _numero_mois(mois_fin_nom)
         if not mois_fin:
-            continue  # "du 5 au 12 machin 2026" -> pas une periode, on continue
-        mois_debut = MOIS_FR.get((mois_debut_nom or "").lower()) or mois_fin
+            continue  # "du 5 au 12 machin" -> pas une periode
+        mois_debut = _numero_mois(mois_debut_nom) or mois_fin
 
-        annee_fin = int(annee_fin)
-        if annee_debut:
-            annee_debut = int(annee_debut)
-        elif mois_debut > mois_fin:
-            # "du 28 décembre au 3 janvier 2027" -> le debut est l'annee d'avant
-            annee_debut = annee_fin - 1
+        annee_fin = int(annee_fin) if annee_fin else None
+        annee_debut = int(annee_debut) if annee_debut else None
+        if annee_fin is None and annee_debut is None:
+            # Aucune annee ecrite : on prend l'annee qui rend la periode la
+            # plus proche d'aujourd'hui (gere decembre -> janvier).
+            candidats = []
+            for a in (aujourdhui.year - 1, aujourdhui.year, aujourdhui.year + 1):
+                try:
+                    d = datetime(a, mois_debut, int(jour_debut)).date()
+                    f = datetime(a + (1 if mois_debut > mois_fin else 0), mois_fin, int(jour_fin)).date()
+                except ValueError:
+                    continue
+                if _periode_valide(d, f):
+                    candidats.append((abs((d - aujourdhui).days), d, f))
+            if not candidats:
+                continue
+            _, debut, fin = min(candidats)
         else:
-            annee_debut = annee_fin
+            if annee_fin is None:
+                annee_fin = annee_debut + (1 if mois_debut > mois_fin else 0)
+            if annee_debut is None:
+                # "du 28 decembre au 3 janvier 2027" -> le debut est l'annee d'avant
+                annee_debut = annee_fin - 1 if mois_debut > mois_fin else annee_fin
+            try:
+                debut = datetime(annee_debut, mois_debut, int(jour_debut)).date()
+                fin = datetime(annee_fin, mois_fin, int(jour_fin)).date()
+            except ValueError:
+                continue  # date impossible (31 fevrier...)
+        if _periode_valide(debut, fin):
+            return debut, fin
 
+    for m in _MOTIF_PERIODE_NUM.finditer(texte):
+        j1, m1, a1, j2, m2, a2 = (int(x) for x in m.groups())
         try:
-            debut = datetime(annee_debut, mois_debut, int(jour_debut)).date()
-            fin = datetime(annee_fin, mois_fin, int(jour_fin)).date()
+            debut, fin = datetime(a1, m1, j1).date(), datetime(a2, m2, j2).date()
         except ValueError:
-            continue  # date impossible (31 février...) -> ce n'etait pas la periode
-        if fin < debut:
             continue
-        return debut, fin
+        if _periode_valide(debut, fin):
+            return debut, fin
+
+    # Rien trouve : on laisse une trace lisible pour comprendre pourquoi.
+    bas = texte.lower()
+    for repere in ("pharmacies du", "liste des pharmacies", "pharmacies de garde"):
+        i = bas.find(repere)
+        if i != -1:
+            print(f"  Texte autour de '{repere}' : {texte[max(0, i - 40):i + 160]!r}")
+            break
+    else:
+        print(f"  Debut du texte de la page : {texte[:200]!r}")
     return None, None
 
 
@@ -334,6 +417,18 @@ def derniere_semaine_en_base():
     return debut, fin, total
 
 
+def ids_en_garde_actuels():
+    """Ensemble des id actuellement marques de garde dans `pharmacies`."""
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/pharmacies",
+        headers=HEADERS,
+        params={"select": "id", "est_de_garde": "is.true", "limit": "5000"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return {ligne["id"] for ligne in r.json()}
+
+
 def appliquer_gardes(ids_de_garde, semaine_debut, semaine_fin):
     """Ecrit la nouvelle liste de garde en 3 requetes groupees au lieu de
     deux par pharmacie (l'ancienne version faisait ~106 appels HTTP pour
@@ -392,6 +487,26 @@ def appliquer_gardes(ids_de_garde, semaine_debut, semaine_fin):
         )
         r.raise_for_status()
 
+        # Une semaine = UNE liste. Si le script a deja ecrit une liste
+        # differente pour cette meme semaine (INAM a corrige sa page, ou
+        # date estimee), on retire les pharmacies qui n'y sont plus. Sans
+        # ca l'historique s'additionne (51 + 54 = 105 lignes) et fausse le
+        # controle de vraisemblance. Non bloquant : les donnees de l'app
+        # (est_de_garde) sont deja justes a ce stade.
+        try:
+            r = requests.delete(
+                f"{SUPABASE_URL}/rest/v1/gardes_historique",
+                headers={**HEADERS, "Prefer": "return=minimal"},
+                params={
+                    "semaine_debut": f"eq.{semaine_debut.isoformat()}",
+                    "pharmacie_id": f"not.in.({liste})",
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            print(f"AVERTISSEMENT : nettoyage de l'historique impossible ({exc}).")
+
 
 def logguer_non_reconnues(entrees, semaine_debut):
     if not entrees:
@@ -433,7 +548,7 @@ def main():
         print("-> Formulation probablement modifiee. On continue quand meme avec une date estimee.")
         aujourdhui = datetime.now().date()
         semaine_debut = aujourdhui - timedelta(days=aujourdhui.weekday())
-        semaine_fin = semaine_debut + timedelta(days=6)
+        semaine_fin = semaine_debut + timedelta(days=7)  # meme style qu'INAM : lundi -> lundi suivant
         periode_incertaine = True
 
     dernier_debut, dernier_fin, dernier_total = derniere_semaine_en_base()
@@ -465,9 +580,13 @@ def main():
 
     # Controle de vraisemblance : une chute brutale du nombre de pharmacies
     # est presque toujours le signe d'une page tronquee, pas d'une vraie
-    # semaine calme.
-    if dernier_total and len(entrees) < dernier_total * FRACTION_MINIMALE:
-        print(f"ERREUR : {len(entrees)} pharmacies contre {dernier_total} la semaine derniere.")
+    # semaine calme. La reference est la liste ACTUELLEMENT en garde dans
+    # `pharmacies` (ce que voient les utilisateurs), et non le compte de
+    # l'historique : celui-ci peut contenir deux listes accumulees.
+    en_garde_actuel = ids_en_garde_actuels()
+    reference = len(en_garde_actuel) or dernier_total
+    if reference and len(entrees) < reference * FRACTION_MINIMALE:
+        print(f"ERREUR : {len(entrees)} pharmacies contre {reference} actuellement de garde.")
         print("-> Chute suspecte. Arret par securite, aucune donnee modifiee.")
         sys.exit(1)
 
@@ -503,6 +622,15 @@ def main():
         print("-> Les noms sur inam.tg ne correspondent plus du tout a la base.")
         print("   Arret par securite : l'ancienne liste de garde est conservee.")
         sys.exit(1)
+
+    # Liste identique a celle deja en garde : rien a ecrire. Evite de refaire
+    # le meme travail (et de re-logger les memes non reconnues) a chaque
+    # passage horaire quand la periode n'a pas pu etre lue sur la page.
+    meme_liste = set(ids_de_garde) == en_garde_actuel
+    meme_semaine = dernier_debut == semaine_debut.isoformat()
+    if meme_liste and not FORCE and (meme_semaine or periode_incertaine):
+        print("Liste identique a celle deja en garde -> rien a faire.")
+        return
 
     if DRY_RUN:
         print("\n--- MODE TEST : rien n'est ecrit en base ---")
