@@ -18,7 +18,7 @@ Pourquoi un arret precoce
 -------------------------
 La liste ne change qu'une fois par semaine, mais le workflow passe toutes
 les heures les dimanche/lundi/mardi (on ne sait pas quand INAM publie).
-Sans garde-fou, c'est ~72 passages qui refont le meme travail. On compare
+Sans garde-fou, ce sont ~90 passages qui refont le meme travail. On compare
 donc la periode lue sur la page a ce qui est deja dans gardes_historique :
 si c'est la meme semaine, on sort immediatement sans rien ecrire.
 
@@ -337,29 +337,36 @@ def derniere_semaine_en_base():
 def appliquer_gardes(ids_de_garde, semaine_debut, semaine_fin):
     """Ecrit la nouvelle liste de garde en 3 requetes groupees au lieu de
     deux par pharmacie (l'ancienne version faisait ~106 appels HTTP pour
-    53 pharmacies, autant d'occasions d'echouer a mi-parcours)."""
+    53 pharmacies, autant d'occasions d'echouer a mi-parcours).
+
+    Ordre : activer les nouvelles, desactiver les anciennes, historique.
+    Il n'y a donc jamais d'instant ou la base affiche zero pharmacie."""
     maintenant = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
-    # 1. Tout le monde a false
-    r = requests.patch(
-        f"{SUPABASE_URL}/rest/v1/pharmacies",
-        headers=HEADERS,
-        params={"est_de_garde": "is.true"},
-        json={"est_de_garde": False},
-        timeout=60,
-    )
-    r.raise_for_status()
-
     if not ids_de_garde:
-        return
+        return  # securite : ne jamais vider la liste (main() l'empeche deja)
 
-    # 2. Les pharmacies de garde a true, en un seul appel
     liste = ",".join(str(i) for i in ids_de_garde)
+
+    # 1. Les nouvelles pharmacies de garde a true, en un seul appel.
+    #    On fait ca EN PREMIER : l'app n'affiche jamais une liste vide,
+    #    meme si le script s'interrompt entre deux etapes.
     r = requests.patch(
         f"{SUPABASE_URL}/rest/v1/pharmacies",
         headers=HEADERS,
         params={"id": f"in.({liste})"},
         json={"est_de_garde": True, "derniere_maj_garde": maintenant},
+        timeout=60,
+    )
+    r.raise_for_status()
+
+    # 2. Puis on retire la garde a celles de la semaine precedente qui ne
+    #    sont plus dans la nouvelle liste (et seulement celles-la).
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/pharmacies",
+        headers=HEADERS,
+        params={"est_de_garde": "is.true", "id": f"not.in.({liste})"},
+        json={"est_de_garde": False},
         timeout=60,
     )
     r.raise_for_status()
@@ -431,6 +438,16 @@ def main():
 
     dernier_debut, dernier_fin, dernier_total = derniere_semaine_en_base()
     print(f"Derniere semaine en base : {dernier_debut} -> {dernier_fin} ({dernier_total} pharmacies)")
+
+    # Liste INAM perimee : la periode affichee est terminee et la suivante
+    # n'est pas encore publiee. Ce n'est PAS une erreur (le workflow
+    # repasse tout seul, y compris mercredi/jeudi), juste une trace dans
+    # le journal pour savoir pourquoi rien ne bouge.
+    aujourdhui_utc = datetime.now(timezone.utc).date()
+    if not periode_incertaine and semaine_fin < aujourdhui_utc:
+        retard = (aujourdhui_utc - semaine_fin).days
+        print(f"ATTENTION : INAM affiche encore la semaine du {semaine_debut} au {semaine_fin} "
+              f"(terminee depuis {retard} jour(s)). Nouvelle liste pas encore publiee.")
 
     # Arret precoce : rien de nouveau a faire.
     if dernier_debut == semaine_debut.isoformat() and not FORCE and not periode_incertaine:

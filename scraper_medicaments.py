@@ -44,6 +44,14 @@ Variables d'environnement (secrets GitHub Actions) :
   SUPABASE_URL          ex: https://xxxxx.supabase.co
   SUPABASE_SERVICE_KEY  la cle "service_role" (jamais la cle publique)
 
+Passages multiples (le 5, puis 6, 7 et 10 du mois)
+--------------------------------------------------
+Le script compare ce qu'il lit sur la page avec ce qui est deja en base et
+n'envoie QUE les medicaments nouveaux ou modifies. Si rien n'a change, il
+le dit et s'arrete sans rien ecrire : "catalogue deja a jour". Les passages
+suivants le 5 sont donc sans cout et sans risque -- ils ne font que
+reconfirmer, jusqu'a ce que l'INAM ait publie sa mise a jour.
+
 Options :
   --dry-run   analyse la page et affiche un rapport, sans RIEN ecrire en base
 """
@@ -71,6 +79,16 @@ SEUIL_MINIMUM = 3500
 TAILLE_LOT = 500
 
 DRY_RUN = "--dry-run" in sys.argv
+
+# Champs comparés pour savoir si un medicament a change (derniere_maj et les
+# parts calculees sont exclus : ils changent sans que la page INAM change).
+CHAMPS_COMPARES = [
+    "nom_commercial", "dci", "dosage", "forme", "groupe_therapeutique",
+    "type_medicament", "quantite_presentation", "unite_presentation",
+    "type_emballage", "prix_public", "base_remboursement",
+    "taux_prise_en_charge", "statut",
+]
+TAILLE_PAGE = 1000  # PostgREST renvoie au plus 1000 lignes par requete
 
 
 # ------------------------------------------------------------------
@@ -287,6 +305,56 @@ def envoyer(medicaments, url, headers):
 
 
 # ------------------------------------------------------------------
+# Detection des changements
+# ------------------------------------------------------------------
+
+def recuperer_existants(url, headers):
+    """{code: ligne} de tous les medicaments deja en base (par pages de 1000)."""
+    existants, debut = {}, 0
+    while True:
+        r = requests.get(
+            f"{url}/rest/v1/medicaments",
+            headers=headers,
+            params={
+                "select": "code," + ",".join(CHAMPS_COMPARES),
+                "code": "not.is.null",
+                "order": "code.asc",
+                "limit": str(TAILLE_PAGE),
+                "offset": str(debut),
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        page = r.json()
+        for ligne in page:
+            existants[ligne["code"]] = ligne
+        if len(page) < TAILLE_PAGE:
+            return existants
+        debut += TAILLE_PAGE
+
+
+def _egal(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return float(a) == float(b)
+    return a == b
+
+
+def separer_changements(medicaments, existants):
+    """-> (nouveaux, modifies). Un medicament identique a celui en base n'est
+    dans aucune des deux listes."""
+    nouveaux, modifies = [], []
+    for m in medicaments:
+        ancien = existants.get(m["code"])
+        if ancien is None:
+            nouveaux.append(m)
+        elif any(not _egal(m[c], ancien.get(c)) for c in CHAMPS_COMPARES):
+            modifies.append(m)
+    return nouveaux, modifies
+
+
+# ------------------------------------------------------------------
 # Programme principal
 # ------------------------------------------------------------------
 
@@ -310,7 +378,7 @@ def main():
     avec_taux = sum(1 for m in medicaments if m["taux_prise_en_charge"] is not None)
     print(f"  dont {avec_prix} avec prix et {avec_taux} avec taux de prise en charge")
 
-      # Garde-fou n2 : le nombre de medicaments peut rester correct meme si
+    # Garde-fou n2 : le nombre de medicaments peut rester correct meme si
     # INAM renomme un libelle de champ ("Prix Public" -> autre chose). Dans
     # ce cas c(...) ne trouve plus rien et prix_public devient None pour
     # (presque) tout le monde, SANS faire baisser le total -- le garde-fou
@@ -343,8 +411,24 @@ def main():
         "Content-Type": "application/json",
     }
 
+    # Ne renvoyer que ce qui a change. Si la lecture de la base echoue, on
+    # retombe sur l'ancien comportement (tout envoyer) : jamais de perte.
+    a_envoyer = medicaments
+    try:
+        existants = recuperer_existants(url, headers)
+        nouveaux, modifies = separer_changements(medicaments, existants)
+        print(f"  {len(existants)} medicaments deja en base : "
+              f"{len(nouveaux)} nouveaux, {len(modifies)} modifies, "
+              f"{len(medicaments) - len(nouveaux) - len(modifies)} identiques")
+        if not nouveaux and not modifies:
+            print("\nCatalogue deja a jour : aucun changement chez l'INAM -> rien a faire.")
+            return
+        a_envoyer = nouveaux + modifies
+    except Exception as exc:  # noqa: BLE001
+        print(f"AVERTISSEMENT : comparaison impossible ({exc}). Envoi complet par securite.")
+
     print("Envoi vers Supabase (upsert sur `code`)...")
-    total = envoyer(medicaments, url, headers)
+    total = envoyer(a_envoyer, url, headers)
     print(f"\nTermine : {total} medicaments crees ou mis a jour.")
 
 

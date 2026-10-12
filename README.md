@@ -13,8 +13,8 @@ quelque chose casse.
 
 | Fichier | Ce qu'il fait | Quand il passe |
 |---|---|---|
-| `scraper_gardes.py` | Liste des pharmacies de garde de la semaine | Toutes les heures, dimanche a mardi |
-| `scraper_medicaments.py` | Catalogue des medicaments et leur remboursement | Le 2 de chaque mois |
+| `scraper_gardes.py` | Liste des pharmacies de garde de la semaine | Toutes les heures dimanche a mardi, toutes les 3 h mercredi/jeudi |
+| `scraper_medicaments.py` | Catalogue des medicaments et leur remboursement | Le 5 du mois a 21h17, puis reconfirmation les 6, 7 et 10 |
 
 Source unique : `https://www.inam.tg/`
 
@@ -74,6 +74,7 @@ script s'arrete si le resultat est suspect :
 | Moitie moins de pharmacies que la semaine derniere | Arret, rien n'est ecrit |
 | Aucun nom ne correspond a la base | Arret, l'ancienne liste est gardee |
 | Moins de 3500 medicaments extraits | Arret, rien n'est ecrit |
+| Moins de 90 % des medicaments avec un prix | Arret, rien n'est ecrit |
 
 Dans tous ces cas, l'app garde les donnees precedentes -- perimees mais
 justes, et datees.
@@ -82,8 +83,11 @@ justes, et datees.
 
 Le script des gardes compare la periode affichee sur inam.tg a ce qui est
 deja dans `gardes_historique`. Si c'est la meme semaine, il s'arrete apres
-2 requetes. Sur les ~72 passages hebdomadaires, un seul fait le travail
+2 requetes. Sur les ~90 passages hebdomadaires, un seul fait le travail
 complet.
+
+Le script des medicaments fait pareil : il compare la page a la base et
+n'envoie que les nouveautes. Sans changement : "catalogue deja a jour".
 
 ---
 
