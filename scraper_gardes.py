@@ -193,20 +193,36 @@ def trouver_correspondance(nom_brut, pharmacies_db, index_sans_prefixe):
 # ------------------------------------------------------------------
 
 def recuperer_page_inam():
-    scraper = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False}
-    )
-    headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-        "Referer": "https://www.google.com/",
-    }
-    resp = scraper.get(INAM_URL, timeout=30, headers=headers)
-    resp.raise_for_status()
-    # INAM ne declare pas de charset alors que ses pages sont en UTF-8 :
-    # sans cette ligne les accents arrivent casses ("DÃ©kon").
-    resp.encoding = "utf-8"
-    return BeautifulSoup(resp.text, "html.parser")
+    html = None
+    try:
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+            "Referer": "https://www.google.com/",
+        }
+        resp = scraper.get(INAM_URL, timeout=30, headers=headers)
+        resp.raise_for_status()
+        # INAM ne declare pas de charset alors que ses pages sont en UTF-8 :
+        # sans cette ligne les accents arrivent casses ("DÃ©kon").
+        resp.encoding = "utf-8"
+        html = resp.text
+    except Exception as e:
+        print(f"Acces direct bloque ({e}) -> passage par le relais Supabase")
+    if html is None:
+        # Relais : une Edge Function Supabase (swift-action) telecharge la
+        # page INAM depuis une autre adresse IP que celle de GitHub.
+        r = requests.post(
+            f"{SUPABASE_URL}/functions/v1/swift-action",
+            headers={"Authorization": f"Bearer {SERVICE_KEY}"},
+            timeout=60,
+        )
+        r.raise_for_status()
+        r.encoding = "utf-8"
+        html = r.text
+    return BeautifulSoup(html, "html.parser")
 
 
 def _nettoyer_texte(texte):
